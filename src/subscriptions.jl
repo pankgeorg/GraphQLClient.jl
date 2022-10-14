@@ -87,18 +87,37 @@ function open_subscription(fn::Function,
 
     sub_id = string(length(keys(subscription_tracker[])) + 1)
     sub_id *= "-" * string(Threads.threadid())
-    message = Dict(
-        "id" => string(sub_id), 
-        "type" => "start", 
-        "payload" => payload
-    )
-    message_str = JSON3.write(message)
 
-    HTTP.WebSockets.open(client.ws_endpoint; retry=retry, headers=client.headers) do ws
+    headers = Dict(client.headers)
+    # We currently implement the `apollographql/subscriptions-transport-ws` which is default in hasura and others
+    # Defined here https://github.com/apollographql/subscriptions-transport-ws/blob/master/PROTOCOL.md
+    # TODO: Add support for the newer `graphql-transport-ws` from the graphql-ws library.
+    # ()
+    headers["Sec-WebSocket-Protocol"] = "apollographql/subscriptions-transport-ws"
+
+    HTTP.WebSockets.open(client.ws_endpoint; retry=retry, headers=headers) do ws
         # Start sub
         output_info(verbose) && println("Starting $(get_name(subscription_name)) subscription with ID $sub_id")
+
+        write(ws, JSON3.write(Dict("id" => sub_id, "type" => GQL_CLIENT_CONNECTION_INIT)))
+        data = readfromwebsocket(ws, stopfn, subtimeout)
+        response = JSON3.read(data, GQLSubscriptionResponse{output_type})
+        while response.type == GQL_SERVER_CONNECTION_KEEP_ALIVE
+            response = JSON3.read(readfromwebsocket(ws, stopfn, subtimeout), GQLSubscriptionResponse{output_type})
+        end
+        if response.type == GQL_SERVER_CONNECTION_ERROR && throw_on_execution_error
+            subscription_tracker[][sub_id] = SUBSCRIPTION_STATUS_ERROR
+            throw(GraphQLError("Error while establishing connection.", payload))
+        end
+
+        start_message = Dict(
+            "id" => string(sub_id), 
+            "type" => GQL_CLIENT_START, 
+            "payload" => payload
+        )
+        message_str = JSON3.write(start_message)
         write(ws, message_str)
-        subscription_tracker[][sub_id] = "open"
+        subscription_tracker[][sub_id] = SUBSCRIPTION_STATUS_OPEN
 
         # Init function
         if !isnothing(initfn)
@@ -111,7 +130,7 @@ function open_subscription(fn::Function,
 
         # Run function
         finish = false
-        while !finish
+        while true
             data = readfromwebsocket(ws, stopfn, subtimeout)
             if data === :timeout
                 output_info(verbose) && println("Subscription $sub_id timed out")
@@ -120,25 +139,46 @@ function open_subscription(fn::Function,
                 output_info(verbose) && println("Subscription $sub_id stopped by the stop function supplied")
                 break
             end
-            response = JSON3.read(data::Vector{UInt8}, GQLSubscriptionResponse{output_type})
+            data = String(data)
+            println(data)
+            response = JSON3.read(data, GQLSubscriptionResponse{output_type})
+
+            response.type == GQL_SERVER_CONNECTION_KEEP_ALIVE && continue
+            response.type == GQL_SERVER_COMPLETE              && break
+            response.type == GQL_SERVER_CONNECTION_ERROR      && begin
+                throw(GraphQLError("Error during subscription. Server reporeted connection error"))
+            end
+            response.type == GQL_SERVER_ERROR                 && begin
+                throw(GraphQLError("Error during subscription - GQL_SERVER_ERROR.", response.payload))
+            end
+            response.type == GQL_SERVER_DATA
+
+
             payload = response.payload
             if !isnothing(payload.errors) && !isempty(payload.errors) && throw_on_execution_error
-                subscription_tracker[][sub_id] = "errored"
+                subscription_tracker[][sub_id] = SUBSCRIPTION_STATUS_ERROR
                 throw(GraphQLError("Error during subscription.", payload))
             end
             # Handle multiple subs, do we need this?
             if response.id == string(sub_id)
-                output_debug(verbose) && println("Result recieved on subscription with ID $sub_id")
+                output_debug(verbose) && println("Result received on subscription with ID $sub_id")
                 finish = fn(payload)
                 if !isa(finish, Bool)
-                    subscription_tracker[][sub_id] = "errored"
+                    subscription_tracker[][sub_id] = SUBSCRIPTION_STATUS_ERROR
                     error("Subscription function must return a boolean")
+                end
+                if finish
+                    # Protocol says we need to let the server know we're unsubscribing
+                    write(ws, JSON3.write(Dict("id" => sub_id, "type" => GQL_CLIENT_STOP)))
+                    write(ws, JSON3.write(Dict("id" => sub_id, "type" => GQL_CLIENT_CONNECTION_TERMINATE)))
+                    close(ws)
+                    break
                 end
             end
         end
     end
     output_debug(verbose) && println("Finished. Closing subscription")
-    subscription_tracker[][sub_id] = "closed"
+    subscription_tracker[][sub_id] = SUBSCRIPTION_STATUS_CLOSED
     return
 end
 
